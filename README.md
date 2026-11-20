@@ -1,6 +1,6 @@
 # Clash Meta Background Control
 
-A reproducible GitHub Actions build of **Clash Meta for Android v2.11.37** with an additional explicit broadcast receiver for silent service control from automation apps such as MacroDroid.
+A reproducible GitHub Actions build of **Clash Meta for Android v2.11.37** with an additional explicit broadcast receiver for automation apps such as MacroDroid.
 
 ## What this repository changes
 
@@ -12,7 +12,7 @@ A reproducible GitHub Actions build of **Clash Meta for Android v2.11.37** with 
 
 ## Build
 
-Open **Actions → Build Clash Meta with Background Broadcast Control → Run workflow**.
+Every push to the `build/background-broadcast` branch starts the build workflow automatically. Open the run under **Actions** and download the APK artifact after the run succeeds.
 
 The workflow checks out the official source and its submodules, installs the toolchains used by the upstream project, applies the receiver patch, and runs:
 
