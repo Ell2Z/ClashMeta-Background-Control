@@ -13,6 +13,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
     steps:
       - name: Checkout customization repository
         uses: actions/checkout@v6
@@ -37,11 +40,13 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v5
 
-      # GitHub's ubuntu-latest runner already includes Android SDK command-line tools.
       - name: Install Android NDK and CMake
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "ndk;29.0.14206865" "cmake;3.22.1"
+          set -euo pipefail
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)"
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "ndk;29.0.14206865" "cmake;3.22.1"
 
       - name: Set up Go toolchain used by upstream project
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
