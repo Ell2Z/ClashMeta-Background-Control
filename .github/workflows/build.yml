@@ -37,9 +37,7 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v5
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
+      # GitHub's ubuntu-latest runner already includes Android SDK command-line tools.
       - name: Install Android NDK and CMake
         run: |
           yes | sdkmanager --licenses >/dev/null || true
