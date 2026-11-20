@@ -5,3 +5,5 @@ The workflow builds the official Android project in a separate checkout at tag `
 The build targets the official `meta` product flavor and `release` build type. The expected application ID is `com.github.metacubex.clash.meta`.
 
 The custom receiver is registered as an exported explicit-only component. It accepts the existing START, STOP and TOGGLE action strings. Android may still restrict foreground-service starts from background broadcasts, so device-side behavior must be verified after the APK is built.
+
+The build uses the Android SDK preinstalled on GitHub's `ubuntu-latest` runner and installs the exact NDK version pinned by the upstream Gradle build.
