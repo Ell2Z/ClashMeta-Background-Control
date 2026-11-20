@@ -1,0 +1,123 @@
+name: Build Clash Meta with Background Broadcast Control
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - build/background-broadcast
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout customization repository
+        uses: actions/checkout@v6
+        with:
+          path: customization
+
+      - name: Checkout official Clash Meta v2.11.37 source
+        uses: actions/checkout@v6
+        with:
+          repository: MetaCubeX/ClashMetaForAndroid
+          ref: v2.11.37
+          path: source
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK and CMake
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "ndk;29.0.14206865" "cmake;3.22.1"
+
+      - name: Set up Go toolchain used by upstream project
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-download-base-url: https://github.com/MetaCubeX/go/releases/download/build
+          go-version: '1.26'
+
+      - name: Apply background broadcast receiver
+        working-directory: source
+        run: |
+          set -euo pipefail
+          install -D "$GITHUB_WORKSPACE/customization/patch/ExternalControlReceiver.kt" \
+            app/src/main/java/com/github/kr328/clash/ExternalControlReceiver.kt
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          manifest = Path("app/src/main/AndroidManifest.xml")
+          content = manifest.read_text(encoding="utf-8")
+          component = 'android:name=".ExternalControlReceiver"'
+          if component in content:
+              raise SystemExit("ExternalControlReceiver is already registered; refusing to duplicate it")
+          marker = "    </application>"
+          if content.count(marker) != 1:
+              raise SystemExit("Could not find exactly one application closing tag in AndroidManifest.xml")
+          receiver = """        <!-- Explicitly address this receiver from MacroDroid or another automation app. -->
+                  <receiver
+                      android:name=".ExternalControlReceiver"
+                      android:enabled="true"
+                      android:exported="true" />
+          """
+          manifest.write_text(content.replace(marker, receiver + marker), encoding="utf-8")
+          PY
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          build_file = Path("build.gradle.kts")
+          content = build_file.read_text(encoding="utf-8")
+          old_name = 'versionName = "2.11.36"'
+          old_code = "versionCode = 211036"
+          if content.count(old_name) != 1 or content.count(old_code) != 1:
+              raise SystemExit("Unexpected upstream version fields; refusing an unsafe version rewrite")
+          content = content.replace(old_name, 'versionName = "2.11.37"')
+          content = content.replace(old_code, "versionCode = 211037")
+          build_file.write_text(content, encoding="utf-8")
+          PY
+
+      - name: Update CA certificates for Go core build
+        working-directory: source
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates
+          sudo update-ca-certificates
+          install -D /etc/ssl/certs/ca-certificates.crt \
+            core/src/foss/golang/clash/component/ca/ca-certificates.crt
+
+      - name: Build installable Meta flavor APKs
+        working-directory: source
+        run: |
+          ./gradlew --no-daemon --stacktrace app:assembleMetaRelease
+
+      - name: Verify APK outputs and calculate checksums
+        working-directory: source
+        run: |
+          set -euo pipefail
+          find app/build/outputs/apk/meta/release -maxdepth 1 -type f -name '*.apk' -print
+          test -n "$(find app/build/outputs/apk/meta/release -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          sha256sum app/build/outputs/apk/meta/release/*.apk
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: Clash-Meta-v2.11.37-background-broadcast
+          path: source/app/build/outputs/apk/meta/release/*.apk
+          if-no-files-found: error
+          retention-days: 14
