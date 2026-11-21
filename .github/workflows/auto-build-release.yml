@@ -1,0 +1,225 @@
+name: Auto-build and release Clash Meta with Background Broadcast
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: Build even if this upstream version was already released here
+        required: false
+        type: boolean
+        default: true
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: clash-meta-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  check-upstream:
+    name: Check upstream release
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_tag: ${{ steps.resolve.outputs.upstream_tag }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+    steps:
+      - name: Checkout customization repository
+        uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - name: Resolve latest upstream release and update version record
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_BUILD: ${{ inputs.force_build || false }}
+        run: |
+          set -euo pipefail
+          UPSTREAM_TAG="$(gh api repos/MetaCubeX/ClashMetaForAndroid/releases/latest --jq .tag_name)"
+          if [[ ! "$UPSTREAM_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unexpected upstream release tag: $UPSTREAM_TAG" >&2
+            exit 1
+          fi
+
+          OUR_LATEST_TAG="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)"
+          SHOULD_BUILD=false
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$FORCE_BUILD" == "true" ]]; then
+            SHOULD_BUILD=true
+          elif [[ "$UPSTREAM_TAG" != "$OUR_LATEST_TAG" ]]; then
+            SHOULD_BUILD=true
+          fi
+
+          printf 'upstream_tag=%s\n' "$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+          printf 'should_build=%s\n' "$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+          echo "Upstream: $UPSTREAM_TAG"
+          echo "Latest custom release: ${OUR_LATEST_TAG:-none}"
+          echo "Build required: $SHOULD_BUILD"
+
+          printf '%s\n' "$UPSTREAM_TAG" > UPSTREAM_VERSION
+          if ! git diff --quiet -- UPSTREAM_VERSION; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add UPSTREAM_VERSION
+            git commit -m "chore: track upstream $UPSTREAM_TAG"
+            git push
+          fi
+
+  build-and-release:
+    name: Build, sign and publish APKs
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      UPSTREAM_TAG: ${{ needs.check-upstream.outputs.upstream_tag }}
+    steps:
+      - name: Checkout customization repository
+        uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - name: Checkout official Clash Meta source
+        uses: actions/checkout@v6
+        with:
+          repository: MetaCubeX/ClashMetaForAndroid
+          ref: ${{ needs.check-upstream.outputs.upstream_tag }}
+          path: source
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Install Android NDK and CMake
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)"
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "ndk;29.0.14206865" "cmake;3.22.1"
+
+      - name: Set up Go toolchain used by upstream project
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-download-base-url: https://github.com/MetaCubeX/go/releases/download/build
+          go-version: "1.26"
+
+      - name: Apply receiver patch and align app version
+        working-directory: source
+        env:
+          SIGNING_KEYSTORE_BASE64: ${{ secrets.CMFA_KEYSTORE_BASE64 }}
+          SIGNING_PASSWORD: ${{ secrets.CMFA_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          install -D "$GITHUB_WORKSPACE/patch/ExternalControlReceiver.kt" \
+            app/src/main/java/com/github/kr328/clash/ExternalControlReceiver.kt
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          manifest = Path("app/src/main/AndroidManifest.xml")
+          content = manifest.read_text(encoding="utf-8")
+          component = 'android:name=".ExternalControlReceiver"'
+          if component in content:
+              raise SystemExit("ExternalControlReceiver is already registered; refusing to duplicate it")
+          marker = "    </application>"
+          if content.count(marker) != 1:
+              raise SystemExit("Could not find exactly one application closing tag in AndroidManifest.xml")
+          receiver = """        <!-- Explicitly address this receiver from MacroDroid or another automation app. -->
+                  <receiver
+                      android:name=".ExternalControlReceiver"
+                      android:enabled="true"
+                      android:exported="true" />
+          """
+          manifest.write_text(content.replace(marker, receiver + marker), encoding="utf-8")
+
+          import os, re
+          tag = os.environ["UPSTREAM_TAG"]
+          match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", tag)
+          if not match:
+              raise SystemExit(f"Unsupported upstream version tag: {tag}")
+          major, minor, patch = map(int, match.groups())
+          version_name = f"{major}.{minor}.{patch}"
+          version_code = major * 100000 + minor * 1000 + patch
+
+          build_file = Path("build.gradle.kts")
+          build = build_file.read_text(encoding="utf-8")
+          build, n1 = re.subn(r'versionName = "[^"]+"', f'versionName = "{version_name}"', build)
+          build, n2 = re.subn(r"versionCode = \d+", f"versionCode = {version_code}", build)
+          if n1 != 1 or n2 != 1:
+              raise SystemExit("Unexpected upstream version fields; refusing an unsafe version rewrite")
+          build_file.write_text(build, encoding="utf-8")
+          PY
+
+          test -n "$SIGNING_KEYSTORE_BASE64" || { echo "Missing repository secret CMFA_KEYSTORE_BASE64"; exit 1; }
+          test -n "$SIGNING_PASSWORD" || { echo "Missing repository secret CMFA_KEYSTORE_PASSWORD"; exit 1; }
+          printf '%s' "$SIGNING_KEYSTORE_BASE64" | base64 --decode > release.keystore
+          cat > signing.properties <<EOF
+          keystore.password=$SIGNING_PASSWORD
+          key.alias=clashmeta
+          key.password=$SIGNING_PASSWORD
+          EOF
+          chmod 600 release.keystore signing.properties
+
+      - name: Update CA certificates for Go core build
+        working-directory: source
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates
+          sudo update-ca-certificates
+          install -D /etc/ssl/certs/ca-certificates.crt \
+            core/src/foss/golang/clash/component/ca/ca-certificates.crt
+
+      - name: Build signed Meta flavor APKs
+        working-directory: source
+        run: ./gradlew --no-daemon --stacktrace app:assembleMetaRelease
+
+      - name: Verify APKs and calculate SHA-256 checksums
+        working-directory: source
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/meta/release/*.apk)
+          test "${#apks[@]}" -gt 0
+          sha256sum "${apks[@]}" | tee "$GITHUB_WORKSPACE/SHA256SUMS.txt"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Clash-Meta-${{ needs.check-upstream.outputs.upstream_tag }}-background-broadcast
+          path: |
+            source/app/build/outputs/apk/meta/release/*.apk
+            SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-upstream.outputs.upstream_tag }}
+          name: Clash Meta ${{ needs.check-upstream.outputs.upstream_tag }} - Background Broadcast
+          body: |
+            Automatically built from the official MetaCubeX/ClashMetaForAndroid release ${{ needs.check-upstream.outputs.upstream_tag }} with the MacroDroid background broadcast receiver patch.
+
+            - Package: `com.github.metacubex.clash.meta`
+            - Signing: persistent private keystore configured in GitHub Actions Secrets
+            - SHA-256 checksums are included as `SHA256SUMS.txt`
+          files: |
+            source/app/build/outputs/apk/meta/release/*.apk
+            SHA256SUMS.txt
+          overwrite_files: true
+          make_latest: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
